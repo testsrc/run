@@ -1,0 +1,43 @@
+# Once a month: a pull request that moves testsrc.lock to the newest testsrc snapshot, with the cases it adds and
+# removes. Copy to .github/workflows/testsrc-update.yml. Needs the TESTSRC_TOKEN secret, and in the repository's
+# Settings > Actions > General: "Allow GitHub Actions to create and approve pull requests".
+# Pull requests opened with GITHUB_TOKEN don't start other workflows: close and reopen it to run testsrc on it, or
+# put a fine-grained token (contents and pull requests: write) in a TESTSRC_PR_TOKEN secret.
+name: testsrc snapshot update
+on:
+  schedule: [{ cron: "0 6 1 * *" }]
+  workflow_dispatch:
+permissions:
+  contents: write
+  pull-requests: write
+jobs:
+  update:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Move testsrc.lock to the newest snapshot
+        env:
+          TESTSRC_TOKEN: ${{ secrets.TESTSRC_TOKEN }}
+          GH_TOKEN: ${{ secrets.TESTSRC_PR_TOKEN || github.token }}
+          API: https://testsrc.com/v1
+        run: |
+          old=$(sed -n 's/^snapshot *= *"\{0,1\}\([0-9][0-9.-]*\).*/\1/p' testsrc.lock 2>/dev/null | head -1)
+          new=$(curl -fsS "$API/snapshots" | jq -r .latest)
+          if [ -z "$new" ] || [ "$old" = "$new" ]; then echo "testsrc.lock is on the newest snapshot (${old:-none})"; exit 0; fi
+          branch="testsrc/snapshot-$new"
+          if git ls-remote --exit-code origin "refs/heads/$branch" >/dev/null; then echo "$branch exists already"; exit 0; fi
+          auth() { printf 'Authorization: Bearer %s\n' "$TESTSRC_TOKEN"; }   # on stdin, not on the command line
+          ids() { auth | curl -fsS -H @- "$API/catalog?snapshot=$1" | jq -r '.cases[].id' | sort; }
+          { echo "Moves the testsrc snapshot from ${old:-none} to $new. Check the run on this pull request before merging."
+            if [ -n "$old" ] && ids "$old" > "$RUNNER_TEMP/old.txt" && ids "$new" > "$RUNNER_TEMP/new.txt"; then
+              cd "$RUNNER_TEMP"
+              echo; echo "$(comm -13 old.txt new.txt | wc -l) cases added, $(comm -23 old.txt new.txt | wc -l) removed:"
+              echo; comm -13 old.txt new.txt | sed "s/.*/- added \`&\`/" | head -200
+              comm -23 old.txt new.txt | sed "s/.*/- removed \`&\`/" | head -200
+              cd "$GITHUB_WORKSPACE"
+            fi; } > "$RUNNER_TEMP/body.md"
+          printf '# The testsrc snapshot this repository tests against, written by testsrc/run. Commit it to keep\n# every run on the same files; the monthly update job moves it to the next snapshot.\nsnapshot = "%s"\n' "$new" > testsrc.lock
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c "$branch" && git add testsrc.lock && git commit -m "testsrc: snapshot $new" && git push origin "$branch"
+          gh pr create --head "$branch" --title "testsrc: snapshot $new" --body-file "$RUNNER_TEMP/body.md"

@@ -1,0 +1,14 @@
+[package]
+name = "testsrc-core"
+description = "testsrc frame code, reader and checker. No I/O, so it also builds for WebAssembly."
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
+# float_roundtrip: parse JSON numbers exactly as Python does, so events give the same verdicts
+serde_json = { version = "1", features = ["float_roundtrip"] }
+
+[dev-dependencies]
+flate2 = "1"

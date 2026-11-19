@@ -1,0 +1,45 @@
+# testsrc for any player, through its command line. Copy to .github/workflows/testsrc.yml.
+# Needs a repository secret TESTSRC_TOKEN (a token from https://testsrc.com/account).
+# Each case runs as `command` with {file} replaced by the case's path, in its own process. testsrc sees what the
+# process does: exit code, crash, hang, how long it took. Make the player play to the end and exit (no window,
+# no waiting for input), and exit non-zero when it can't play a file.
+name: testsrc (your player)
+on:
+  pull_request:
+  schedule: [{ cron: "0 4 * * 1" }]
+  workflow_dispatch:
+    inputs:
+      set:
+        description: "weekly: the weekly run's 30 cases. all: every case (company tokens only)."
+        type: choice
+        options: [weekly, all]
+        default: weekly
+# Pull requests: the 10 starter cases. Every Monday: TESTSRC_WEEKLY, the starter cases and 20 more, 30 different
+# cases in all, which an evaluation token can fetch. Swap ids as you like (testsrc.com/cases). Every case (`all`)
+# only by hand (Actions > this workflow > Run workflow), and only with a company token.
+env:
+  TESTSRC_WEEKLY: >-
+    starter edge/anamorphic-sar-4-3.mp4 edge/audio-starts-500ms-late.mp4
+    edge/av1-hdr10.mkv edge/hevc-yuv422.mp4 edge/low-fps-10.mp4
+    edge/mka-opus-codec-delay.mka edge/mkv-forced-not-default-subs.mkv edge/mkv-no-cues.mkv
+    edge/opus-5.1-family-1.opus edge/rotation-90-display-matrix.mp4 edge/single-frame-video.mp4
+    edge/ts-pcr-wrap.ts edge/ts-starts-at-large-pts.ts edge/tx3g-cjk.mp4
+    edge/vfr-screen-recording.mp4 edge/wav-7.1-extensible.wav dash/fmp4.mpd
+    hls/abr-ladder.m3u8 channels/5.1.mp4 scan/1080i-tff.mp4
+jobs:
+  testsrc:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the player
+        run: ./build.sh        # yours
+      - uses: testsrc/run@v1
+        with:
+          token: ${{ secrets.TESTSRC_TOKEN }}
+          player: cmd
+          command: ./build/myplayer --headless --exit-at-end {file}
+          set: ${{ github.event_name == 'pull_request' && 'starter' || (github.event_name == 'workflow_dispatch' && inputs.set == 'all') && 'all' || env.TESTSRC_WEEKLY }}
+          exclude: duration/
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: testsrc, path: testsrc-results/ }

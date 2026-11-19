@@ -1,0 +1,56 @@
+# testsrc for a player built on FFmpeg. Copy to .github/workflows/testsrc.yml.
+# Needs a repository secret TESTSRC_TOKEN (a token from https://testsrc.com/account).
+# --player ffmpeg decodes each case with the ffmpeg and ffprobe on PATH and checks every frame, its timestamp and
+# the audio: build them from the FFmpeg your player links (same version, configure flags and patches), so the
+# demuxers and decoders under test are the ones you ship. Needs FFmpeg 5.1 or later.
+# The second step runs your own player binary too, through its command line (see cmd-player.yml).
+name: testsrc (FFmpeg-based player)
+on:
+  pull_request:
+  schedule: [{ cron: "0 4 * * 1" }]
+  workflow_dispatch:
+    inputs:
+      set:
+        description: "weekly: the weekly run's 30 cases. all: every case (company tokens only)."
+        type: choice
+        options: [weekly, all]
+        default: weekly
+# Pull requests: the 10 starter cases. Every Monday: TESTSRC_WEEKLY, the starter cases and 20 more, 30 different
+# cases in all, which an evaluation token can fetch. Swap ids as you like (testsrc.com/cases). Every case (`all`)
+# only by hand (Actions > this workflow > Run workflow), and only with a company token.
+env:
+  TESTSRC_WEEKLY: >-
+    starter edge/anamorphic-sar-4-3.mp4 edge/audio-starts-500ms-late.mp4
+    edge/av1-hdr10.mkv edge/hevc-yuv422.mp4 edge/low-fps-10.mp4
+    edge/mka-opus-codec-delay.mka edge/mkv-forced-not-default-subs.mkv edge/mkv-no-cues.mkv
+    edge/opus-5.1-family-1.opus edge/rotation-90-display-matrix.mp4 edge/single-frame-video.mp4
+    edge/ts-pcr-wrap.ts edge/ts-starts-at-large-pts.ts edge/tx3g-cjk.mp4
+    edge/vfr-screen-recording.mp4 edge/wav-7.1-extensible.wav dash/fmp4.mpd
+    hls/abr-ladder.m3u8 channels/5.1.mp4 scan/1080i-tff.mp4
+jobs:
+  testsrc:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      # Replace with the build of your FFmpeg, then put its bin/ on PATH: echo "$PWD/ffmpeg-build/bin" >> "$GITHUB_PATH"
+      - name: FFmpeg as your player ships it
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
+      - name: Frame by frame, through FFmpeg
+        uses: testsrc/run@v1
+        with:
+          token: ${{ secrets.TESTSRC_TOKEN }}
+          player: ffmpeg
+          set: ${{ github.event_name == 'pull_request' && 'starter' || (github.event_name == 'workflow_dispatch' && inputs.set == 'all') && 'all' || env.TESTSRC_WEEKLY }}
+          exclude: duration/
+          out: testsrc-ffmpeg
+      # Optional: your player itself. Only what its process does (exit code, crash, hang), not what it showed.
+      # - name: Your player
+      #   uses: testsrc/run@v1
+      #   with:
+      #     token: ${{ secrets.TESTSRC_TOKEN }}
+      #     player: cmd
+      #     command: ./build/myplayer --headless --exit-at-end {file}
+      #     out: testsrc-myplayer
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: testsrc, path: "testsrc-*/" }

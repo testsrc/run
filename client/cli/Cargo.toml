@@ -1,0 +1,20 @@
+[package]
+name = "testsrc"
+description = "testsrc runner: fetches test media through the API and checks how a player plays it"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "testsrc"
+path = "src/main.rs"
+
+[dependencies]
+testsrc-core = { path = "../core" }
+serde_json = { version = "1", features = ["float_roundtrip"] }
+clap = { version = "4", features = ["derive", "env"] }
+ureq = "2"
+sha2 = "0.10"
+libloading = "0.8"
+regex = "1"

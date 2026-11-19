@@ -1,0 +1,103 @@
+name: testsrc run
+description: Play testsrc's test media through your player and check it frame by frame. JUnit report and job summary.
+author: testsrc
+branding: { icon: play-circle, color: purple }
+
+inputs:
+  token:
+    description: A testsrc API token (testsrc.com/account), from a repository secret.
+    required: true
+  player:
+    description: "libvlc, ffmpeg, gstreamer, mpv, or cmd (any player through its command line: set `command`)."
+    default: libvlc
+  command:
+    description: "For player: cmd. The command line, with {file} for the case's path, like `./build/myplayer --headless {file}`."
+    default: ""
+  set:
+    description: "Which cases: starter (10 cases, about two minutes), case ids and prefixes separated by spaces or new lines (hls/ edge/rotation-90-display-matrix.mp4), or all (company tokens only)."
+    default: starter
+  exclude:
+    description: Leave out cases whose id starts with one of these (space or new line separated), like duration/.
+    default: ""
+  snapshot:
+    description: "The snapshot to test against. Empty: the one in the lock file, or the latest, written to the lock file. latest: the newest, lock file untouched. Or a date (2026-11-06)."
+    default: ""
+  lock:
+    description: The lock file that pins the snapshot.
+    default: testsrc.lock
+  report-only:
+    description: "true: report failures in the summary and JUnit, but don't fail the job. Errors (a bad token, no such case, a quota hit mid-run) still fail it, after the report."
+    default: "false"
+  runner-version:
+    description: A runner version (0.2.0 or later), or latest.
+    default: latest
+  out:
+    description: Where results.json, report.xml and the players' events go.
+    default: testsrc-results
+  api:
+    description: The API base URL.
+    default: https://testsrc.com/v1
+
+outputs:
+  snapshot:
+    description: The snapshot the run used.
+    value: ${{ steps.resolve.outputs.snapshot }}
+  results:
+    description: Path of results.json.
+    value: ${{ steps.run.outputs.results }}
+  junit:
+    description: Path of the JUnit report.
+    value: ${{ steps.run.outputs.junit }}
+  failed:
+    description: How many cases failed, crashed or hung.
+    value: ${{ steps.run.outputs.failed }}
+
+runs:
+  using: composite
+  steps:
+    - id: resolve
+      shell: bash
+      run: bash "$GITHUB_ACTION_PATH/run.sh" resolve
+      env:
+        TESTSRC_TOKEN: ${{ inputs.token }}
+        IN_SNAPSHOT: ${{ inputs.snapshot }}
+        IN_LOCK: ${{ inputs.lock }}
+        IN_RUNNER_VERSION: ${{ inputs.runner-version }}
+        IN_SET: ${{ inputs.set }}
+        IN_PLAYER: ${{ inputs.player }}
+        IN_PRIVATE: ${{ github.event.repository.private }}
+        IN_FORK: ${{ github.event.pull_request.head.repo.fork }}
+        IN_ACTOR: ${{ github.actor }}
+        TESTSRC_API: ${{ inputs.api }}
+    - if: steps.resolve.outputs.skip != 'true'
+      uses: actions/cache@v4
+      with:
+        path: ${{ steps.resolve.outputs.runner-dir }}
+        key: testsrc-runner-${{ steps.resolve.outputs.runner-version }}-${{ steps.resolve.outputs.target }}
+    # the media only on private repositories: a public repository's cache can be restored by anyone's pull request
+    - if: steps.resolve.outputs.media-cache == 'true'
+      uses: actions/cache@v4
+      with:
+        path: ${{ steps.resolve.outputs.media-dir }}
+        key: testsrc-media-${{ steps.resolve.outputs.snapshot }}-${{ steps.resolve.outputs.set-key }}
+    - id: run
+      if: steps.resolve.outputs.skip != 'true'
+      shell: bash
+      run: bash "$GITHUB_ACTION_PATH/run.sh" run
+      env:
+        TESTSRC_TOKEN: ${{ inputs.token }}
+        TESTSRC_API: ${{ inputs.api }}
+        TESTSRC_SNAPSHOT: ${{ steps.resolve.outputs.snapshot }}
+        TESTSRC_CACHE: ${{ steps.resolve.outputs.media-dir }}
+        RUNNER_DIR: ${{ steps.resolve.outputs.runner-dir }}
+        RUNNER_URL: ${{ steps.resolve.outputs.runner-url }}
+        RUNNER_SHA256: ${{ steps.resolve.outputs.runner-sha256 }}
+        RUNNER_NAME: ${{ steps.resolve.outputs.runner-name }}
+        IN_PLAYER: ${{ inputs.player }}
+        IN_COMMAND: ${{ inputs.command }}
+        IN_SET: ${{ inputs.set }}
+        IN_EXCLUDE: ${{ inputs.exclude }}
+        IN_REPORT_ONLY: ${{ inputs.report-only }}
+        IN_OUT: ${{ inputs.out }}
+        IN_LOCK_NOTE: ${{ steps.resolve.outputs.lock-note }}
+        IN_DISCARD: ${{ steps.resolve.outputs.discard }}
