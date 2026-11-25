@@ -78,11 +78,15 @@ pub fn junit(results: &[CaseResult], suite: &str) -> String {
     out + "</testsuite>\n"
 }
 
-/// Markdown for the GitHub Actions run summary: counts, then what didn't pass with its first failure.
-pub fn github_summary(results: &[CaseResult], player: &str, snapshot: &str) -> String {
+/// Markdown for the GitHub Actions run summary: counts and what was tested (`tested`: the commit, the versions),
+/// then what didn't pass with its first failure.
+pub fn github_summary(results: &[CaseResult], player: &str, snapshot: &str, tested: &str) -> String {
     let c = counts(results);
     let line: Vec<String> = c.iter().filter(|(_, n)| *n > 0).map(|(s, n)| format!("{n} {s}")).collect();
     let mut md = format!("### testsrc: {player}, snapshot {snapshot}\n\n{}\n\n", line.join(", "));
+    if !tested.is_empty() {
+        md += &format!("{}\n\n", tested.replace('|', "\\|"));
+    }
     let w = warned(results);
     if !w.is_empty() {
         md += &format!("**{} passed with warnings**\n\n| Case | Warning |\n| --- | --- |\n", w.len());
@@ -156,7 +160,7 @@ mod tests {
         assert_eq!(s[1].first_failure(), "");
         assert_eq!(counts(&s).last(), Some(&("with warnings", 1)));
         assert_eq!(counts(&s[..2]).last(), Some(&("with warnings", 0)));
-        let md = github_summary(&s, "mpv 0.41.0", "2026-11-11");
+        let md = github_summary(&s, "mpv 0.41.0", "2026-11-11", "");
         assert!(md.contains("**1 passed with warnings**\n\n| Case | Warning |"));
         assert!(md.contains("| `damage/x-truncated-10.mp4` | frames: partial playback, ended cleanly: 90/180 frames played, missing 90-179 |"));
     }
@@ -173,8 +177,9 @@ mod tests {
 
     #[test]
     fn summary_lists_what_did_not_pass() {
-        let md = github_summary(&sample(), "libvlc 3.0.24", "2026-10-29");
-        assert!(md.starts_with("### testsrc: libvlc 3.0.24, snapshot 2026-10-29\n\n2 pass, 1 fail, 1 crash, 1 skipped, 1 with warnings\n"));
+        let md = github_summary(&sample(), "libvlc 3.0.24", "2026-10-29", "Tested: commit 0123abc (main), runner 0.2.2 on linux x86_64");
+        assert!(md.starts_with("### testsrc: libvlc 3.0.24, snapshot 2026-10-29\n\n2 pass, 1 fail, 1 crash, 1 skipped, 1 with warnings\n\n\
+                                Tested: commit 0123abc (main), runner 0.2.2 on linux x86_64\n\n"));
         assert!(md.contains("| `hls/ts.m3u8` | fail | frames: 179/180 frames shown, missing 179 |"));
         assert!(md.contains(r"ended with a signal: \|x\|")); // pipes escaped inside the table
         assert!(md.contains("<details><summary>2 passed</summary>"));

@@ -28,6 +28,12 @@ inputs:
   report-only:
     description: "true: report failures in the summary and JUnit, but don't fail the job. Errors (a bad token, no such case, a quota hit mid-run) still fail it, after the report."
     default: "false"
+  time-limit:
+    description: "Minutes after which the runner stops and keeps what it has: the report of the cases played, the rest marked not run, and the job fails saying so. Set it a few minutes below the job's timeout-minutes, which ends the job without a report. Empty: no limit. Needs runner 0.3.0."
+    default: ""
+  player-version:
+    description: "Your player's version, as you name it (1.4.2, a build number), recorded in results.json with the commit and the engine's own version (which the runner reads itself). Needs runner 0.3.0."
+    default: ""
   runner-version:
     description: A runner version (0.2.0 or later), or latest.
     default: latest
@@ -65,6 +71,8 @@ runs:
         IN_RUNNER_VERSION: ${{ inputs.runner-version }}
         IN_SET: ${{ inputs.set }}
         IN_PLAYER: ${{ inputs.player }}
+        IN_TIME_LIMIT: ${{ inputs.time-limit }}
+        IN_PLAYER_VERSION: ${{ inputs.player-version }}
         IN_PRIVATE: ${{ github.event.repository.private }}
         IN_FORK: ${{ github.event.pull_request.head.repo.fork }}
         IN_ACTOR: ${{ github.actor }}
@@ -101,3 +109,7 @@ runs:
         IN_OUT: ${{ inputs.out }}
         IN_LOCK_NOTE: ${{ steps.resolve.outputs.lock-note }}
         IN_DISCARD: ${{ steps.resolve.outputs.discard }}
+        IN_TIME_LIMIT: ${{ steps.resolve.outputs.time-limit }}
+        IN_PLAYER_VERSION: ${{ steps.resolve.outputs.player-version }}
+        # a pull request's own head commit: github.sha is then the merge commit GitHub made for the run
+        TESTSRC_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}

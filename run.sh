@@ -6,7 +6,8 @@
 #                    add the lock note to the job summary, and fail the job on failures unless report-only
 # A fork's pull request, or Dependabot's, has no secrets: without the token it gets a notice and is skipped. Any other
 # run without the token fails (a missing or misnamed secret), pull_request_target too (it has the secrets).
-# The runner must be 0.2.0 or later (--discard, results kept when the API stops a run).
+# The runner must be 0.2.0 or later (--discard, results kept when the API stops a run); time-limit and player-version
+# need 0.3.0, and with an older runner they are left out with a warning (the job's timeout-minutes still holds).
 # set: all needs a company token. The media is cached only for private repositories and sets smaller than all;
 # otherwise each case's files are deleted once played (--discard), so the disk holds one case at a time.
 # The token goes to curl on stdin, never on a command line.
@@ -16,6 +17,8 @@ set -euo pipefail
 
 API=${TESTSRC_API:-https://testsrc.com/v1}
 MIN_RUNNER=0.2.0   # the first runner with --discard and results kept when the API stops a run
+VERSIONS_RUNNER=0.3.0   # the first with --time-limit and --player-version
+older() { [ "$1" != "$2" ] && [ "$(printf '%s\n' "$1" "$2" | sort -V | head -1)" = "$1" ]; }   # is $1 before $2
 API=${API%/}
 : "${RUNNER_TEMP:=${TMPDIR:-/tmp}}" "${GITHUB_OUTPUT:=/dev/null}" "${GITHUB_STEP_SUMMARY:=/dev/null}"
 
@@ -30,7 +33,10 @@ get() {
   local code
   REPLY=$(auth | curl -sS -H @- -w '\n%{http_code}' "$API$1") || die "can't reach $API$1"
   code=${REPLY##*$'\n'}; REPLY=${REPLY%$'\n'*}
-  [ "$code" = 200 ] || die "$code from $API$1: $(jq -r '.error // empty' <<<"$REPLY" 2>/dev/null || true)"
+  local why; why=$(jq -r '.error // empty' <<<"$REPLY" 2>/dev/null || true)
+  # a refused token: say where the token comes from and where to get a new one
+  [ "$code" != 401 ] || why="${why%.}. The token is the secret passed as token (secrets.TESTSRC_TOKEN in the templates): check it is set and current, or make a new one at https://testsrc.com/account and update the secret"
+  [ "$code" = 200 ] || die "$code from $API$1: $why"
 }
 words() { tr -s ' \t\r\n' '\n' <<<"$1" | sed '/^$/d'; }
 auth() { printf 'Authorization: Bearer %s\n' "$TESTSRC_TOKEN"; }
@@ -43,10 +49,17 @@ resolve() {
       out skip true
       return
     fi
-    die "no token: add a repository secret with a token from https://testsrc.com/account and pass it as token"
+    die "no token: the token input is empty. Make a token at https://testsrc.com/account (sign in with GitHub), add it as a repository secret named TESTSRC_TOKEN (Settings > Secrets and variables > Actions), and pass it: token: \${{ secrets.TESTSRC_TOKEN }}"
   fi
   out skip false
   case "${IN_PLAYER:-libvlc}" in libvlc|ffmpeg|gstreamer|mpv|cmd) ;; *) die "player must be libvlc, ffmpeg, gstreamer, mpv or cmd, not ${IN_PLAYER}" ;; esac
+  local limit="${IN_TIME_LIMIT:-}" pver="${IN_PLAYER_VERSION:-}"
+  limit=${limit//[[:space:]]/}
+  if [ -n "$limit" ]; then
+    [[ $limit =~ ^[0-9]+(\.[0-9]+)?$ ]] && [[ $limit =~ [1-9] ]] \
+      || die "time-limit is in minutes, like 25, not $limit. Set it a few minutes below the job's timeout-minutes"
+  fi
+  [[ $pver != *$'\n'* ]] || die "player-version must be one line, like 1.4.2 or \${{ github.ref_name }}"
 
   # the snapshot: an input, the lock file, or the latest (then written to the lock file)
   local snap="${IN_SNAPSHOT:-}" lock="${IN_LOCK:-testsrc.lock}" note=""
@@ -95,6 +108,13 @@ resolve() {
   ver=$(jq -r .version <<<"$m")
   [ "$(printf '%s\n' "$MIN_RUNNER" "$ver" | sort -V | head -1)" = "$MIN_RUNNER" ] \
     || die "runner $ver is older than this action needs ($MIN_RUNNER or later): pass a newer runner-version, or latest"
+  if older "$ver" "$VERSIONS_RUNNER"; then
+    [ -z "$limit" ] || echo "::warning title=testsrc::time-limit needs runner $VERSIONS_RUNNER or later; runner $ver runs without it, so only the job's timeout-minutes stops it (and then without a report)."
+    [ -z "$pver" ] || echo "::warning title=testsrc::player-version needs runner $VERSIONS_RUNNER or later; runner $ver doesn't record it in results.json."
+    limit="" pver=""
+  fi
+  out time-limit "$limit"
+  out player-version "$pver"
   out snapshot "$snap"
   out lock-note "$note"
   out runner-version "$ver"
@@ -129,6 +149,8 @@ run() {
   while read -r w; do args+=(--exclude "$w"); done < <(words "${IN_EXCLUDE:-}")
   args+=(--out "$o" --junit "$o/report.xml")
   [ "${IN_DISCARD:-false}" != true ] || args+=(--discard)
+  [ -z "${IN_TIME_LIMIT:-}" ] || args+=(--time-limit "$IN_TIME_LIMIT")
+  [ -z "${IN_PLAYER_VERSION:-}" ] || args+=(--player-version "$IN_PLAYER_VERSION")
 
   local rc=0
   "$bin" "${args[@]}" || rc=$?

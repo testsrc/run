@@ -342,6 +342,12 @@ fn a_player_that_cant_load_is_a_result_and_the_run_goes_on() {
         for c in r["results"].as_array().unwrap() {
             assert!(matches!(c["status"].as_str().unwrap(), "fail" | "crash"), "{player}: {}", c["status"]);
         }
+        assert_eq!(r["engine"], serde_json::Value::Null, "{player}: no version read, none made up");
+        // what to do, said at the first case and at the end, in results.json and the summary (not per case)
+        let err = String::from_utf8_lossy(&out.stderr);
+        let hint = if player == "ffmpeg" { "Put ffmpeg and ffprobe 5.1 or later on PATH" } else { "sudo apt-get install -y" };
+        assert_eq!(err.matches(hint).count(), 2, "{player}: {err}");
+        assert!(r["setup_error"].as_str().unwrap().contains(hint), "{player}");
         if player == "libvlc" {
             assert!(r["player"].as_str().unwrap().ends_with("(RGB callbacks)"));
         }
@@ -451,4 +457,114 @@ fn a_download_that_never_matches_stops_after_two_retries() {
     assert_eq!(r["counts"]["skipped"], 3);
     assert!(r["stopped"].as_str().unwrap().starts_with("checksum mismatch for codec/a.mp4"));
     assert!(!dir.join("cache/2026-11-06/codec/a.mp4").exists(), "no bad file left in the cache");
+}
+
+// Launch plan item 14: --time-limit stops the run like the API does (exit 2, results so far, the rest not run), so the
+// report outlives the CI job's own limit.
+#[test]
+fn the_time_limit_stops_the_run_and_keeps_the_report() {
+    let (base, log) = api(&CASES, None);
+    let dir = tmp("timelimit");
+    // 0.03 min = 1.8 s: a plays (1 s), b is cut while it plays, c is never fetched
+    let out = run(&base, &dir, "sleep 1 # {file}", &["--time-limit", "0.03"]);
+    assert_eq!(out.status.code(), Some(2), "{}", String::from_utf8_lossy(&out.stderr));
+    let r = results(&dir);
+    assert_eq!(r["counts"]["pass"], 1);
+    assert_eq!(r["counts"]["skipped"], 2);
+    assert_eq!(r["counts"]["hang"], 0, "a case cut by the limit isn't the player's hang");
+    assert_eq!(r["time_limit_min"], 0.03);
+    assert_eq!(r["stopped"], "the time limit of 0.03 minutes was reached");
+    assert_eq!(r["results"][1]["checks"][0][2], "not run: the time limit of 0.03 minutes was reached while it played");
+    assert_eq!(r["results"][2]["checks"][0][2], "not run: the time limit of 0.03 minutes was reached");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("testsrc: the time limit of 0.03 minutes was reached. Stopping here"), "{err}");
+    let summary = std::fs::read_to_string(dir.join("summary.md")).unwrap();
+    assert!(summary.contains("**Stopped early:** the time limit of 0.03 minutes was reached. 2 cases weren't run."), "{summary}");
+    assert!(std::fs::read_to_string(dir.join("report.xml")).unwrap().contains("<skipped message=\"not run: the time limit"));
+    assert_eq!(gets_of(&log, "/v1/cases/codec/c.mp4/facts"), 0, "nothing fetched past the limit");
+}
+
+#[test]
+fn a_retry_never_runs_past_the_time_limit() {
+    let (base, _) = api(&["codec/a.mp4", "codec/b.mp4"], None);
+    let dir = tmp("timelimit-retry");
+    // a fails after 1.2 s; its retry is cut at 1.8 s, so a keeps its failure, and b isn't run
+    let out = run(&base, &dir, "sleep 1.2; exit 3 # {file}", &["--time-limit", "0.03", "--retries", "3"]);
+    assert_eq!(out.status.code(), Some(2));
+    let r = results(&dir);
+    assert_eq!(r["results"][0]["status"], "fail");
+    assert_eq!(r["results"][1]["status"], "skipped");
+}
+
+#[test]
+fn a_time_limit_of_zero_is_refused() {
+    let out = testsrc(&["run", "--player", "cmd", "--command", "true {file}", "--time-limit", "0"], "http://127.0.0.1:9/v1", &[]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("--time-limit is in minutes and must be more than 0, not 0"));
+}
+
+// Launch plan item 15: results.json says what was tested.
+#[test]
+fn results_say_what_was_tested() {
+    let (base, _) = api(&["codec/a.mp4"], None);
+    let dir = tmp("versions");
+    let mut c = Command::new(env!("CARGO_BIN_EXE_testsrc"));
+    c.args(["run", "--player", "cmd", "--command", "true {file}", "--player-version", " 1.4.2-rc1 ", "--out"]).arg(dir.join("out"))
+        .env("TESTSRC_API", &base).env("TESTSRC_TOKEN", TOKEN).env("TESTSRC_CACHE", dir.join("cache"))
+        .env("GITHUB_STEP_SUMMARY", dir.join("summary.md")).env_remove("TESTSRC_SNAPSHOT")
+        .env("TESTSRC_COMMIT", "0123456789abcdef0123456789abcdef01234567").env("GITHUB_SHA", "ffff")
+        .env("GITHUB_HEAD_REF", "feature/x").env("GITHUB_REF_NAME", "7/merge").env("GITHUB_REPOSITORY", "acme/player");
+    let out = c.output().unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+    let r = results(&dir);
+    assert_eq!(r["commit"], "0123456789abcdef0123456789abcdef01234567", "TESTSRC_COMMIT (a pull request's head) first");
+    assert_eq!(r["branch"], "feature/x", "a pull request's head branch, not 7/merge");
+    assert_eq!(r["repository"], "acme/player");
+    assert_eq!(r["player_version"], "1.4.2-rc1");
+    assert_eq!(r["engine"], serde_json::Value::Null, "a cmd player has no engine the runner knows");
+    assert_eq!(r["time_limit_min"], serde_json::Value::Null);
+    assert!(r["finished"].as_str().unwrap().ends_with('Z'));
+    let line = "Tested: commit 0123456789ab (feature/x), player version 1.4.2-rc1, runner ";
+    assert!(String::from_utf8_lossy(&out.stdout).contains(line));
+    assert!(std::fs::read_to_string(dir.join("summary.md")).unwrap().contains(line));
+}
+
+// A stub git on PATH (CI's image has none): what `git rev-parse` would print in a checkout of branch $STUB_BRANCH.
+#[test]
+fn outside_actions_the_commit_and_branch_come_from_git() {
+    let (base, _) = api(&["codec/a.mp4"], None);
+    let dir = tmp("versions-git");
+    let bin = dir.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let stub = bin.join("git");
+    std::fs::write(&stub, "#!/bin/sh\ncase \"$*\" in\n  'rev-parse HEAD') echo 0123abcd ;;\n  'rev-parse --abbrev-ref HEAD') echo \"$STUB_BRANCH\" ;;\n  *) exit 1 ;;\nesac\n").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
+    let run_in = |envs: &[(&str, &str)]| {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_testsrc"));
+        c.args(["run", "--player", "cmd", "--command", "true {file}", "--out"]).arg(dir.join("out"))
+            .env("PATH", &path).env("STUB_BRANCH", "dev")
+            .env("TESTSRC_API", &base).env("TESTSRC_TOKEN", TOKEN).env("TESTSRC_CACHE", dir.join("cache"))
+            .env_remove("TESTSRC_SNAPSHOT").env_remove("TESTSRC_COMMIT").env_remove("GITHUB_SHA").env_remove("GITHUB_HEAD_REF")
+            .env_remove("GITHUB_REF_NAME").env_remove("GITHUB_REPOSITORY").env_remove("GITHUB_STEP_SUMMARY").env_remove("TESTSRC_PLAYER_VERSION");
+        for (k, v) in envs {
+            c.env(k, v);
+        }
+        assert_eq!(c.output().unwrap().status.code(), Some(0));
+        results(&dir)
+    };
+    let r = run_in(&[]);
+    assert_eq!(r["commit"], "0123abcd");
+    assert_eq!(r["branch"], "dev");
+    assert_eq!(r["repository"], serde_json::Value::Null);
+    assert_eq!(r["player_version"], serde_json::Value::Null);
+    // a detached checkout ("HEAD") has no branch; GITHUB_SHA and GITHUB_REF_NAME win over git
+    assert_eq!(run_in(&[("STUB_BRANCH", "HEAD")])["branch"], serde_json::Value::Null);
+    let r = run_in(&[("GITHUB_SHA", "abc"), ("GITHUB_REF_NAME", "main"), ("TESTSRC_PLAYER_VERSION", "  ")]);
+    assert_eq!((r["commit"].as_str(), r["branch"].as_str()), (Some("abc"), Some("main")));
+    assert_eq!(r["player_version"], serde_json::Value::Null, "a blank version is no version");
+    // no git at all, or not a checkout: nothing
+    let r = run_in(&[("PATH", "/usr/bin:/bin"), ("GIT_DIR", "/nonexistent")]);
+    assert_eq!((r["commit"].clone(), r["branch"].clone()), (serde_json::Value::Null, serde_json::Value::Null));
 }

@@ -35,6 +35,16 @@ The templates run the 10 starter cases on pull requests, and every Monday a fixe
 starter cases and 20 more, in `TESTSRC_WEEKLY`), which an evaluation token can run. Every case (`set: all`) is
 for company tokens, from a manual run (Actions > the workflow > Run workflow).
 
+**With an AI assistant** (Claude Code, Codex, Cursor), paste this in the repository:
+
+```text
+Set up testsrc in this repository: read https://testsrc.com/llms.txt, find how this project plays video (libvlc, FFmpeg, GStreamer, mpv, or its own player with a command line), add a GitHub Actions workflow that runs testsrc/run on pull requests, and tell me which secret to add.
+```
+
+[testsrc.com/llms.txt](https://testsrc.com/llms.txt) points it at these docs in Markdown and at working workflows in
+[testsrc/examples](https://github.com/testsrc/examples). A player that can't start, a missing secret or a refused
+token each say what to do in the job's log.
+
 The smallest workflow step:
 
 ```yaml
@@ -57,7 +67,9 @@ The smallest workflow step:
 | `snapshot` | | Empty: the one in `testsrc.lock`, or the latest, written to `testsrc.lock`. `latest`: the newest, lock untouched. Or a date: `2026-11-06`. |
 | `lock` | `testsrc.lock` | Where the snapshot is pinned. |
 | `report-only` | `false` | `true`: failures become warnings and the job passes. Errors (a bad token, an unknown case, a limit reached mid-run) still fail it, after the report. |
-| `runner-version` | `latest` | A runner version, like `0.1.0`. |
+| `time-limit` | | Minutes after which the runner stops and keeps what it has: the cases played are in the report, the rest are marked not run, and the job fails saying so. Set it a few minutes below the job's `timeout-minutes`: a job GitHub stops at its limit (6 hours by default) loses its report. Needs runner 0.3.0. |
+| `player-version` | | Your player's version as you name it (`1.4.2`, a build number), kept in `results.json`. Needs runner 0.3.0. |
+| `runner-version` | `latest` | A runner version, like `0.2.0`. |
 | `out` | `testsrc-results` | Where `results.json`, `report.xml` and each case's events go. |
 
 Outputs: `snapshot`, `results`, `junit`, and `failed` (how many cases failed, crashed or hung).
@@ -67,8 +79,23 @@ downloads nothing on a cache hit (it still asks the API for the runner's version
 repository, and for `set: all`, nothing is cached and each case's files are deleted once it has played: a public
 repository's cache can be restored by anyone's pull request, and every case doesn't fit the cache or the disk.
 
-If the API stops a run part-way (the daily quota, an evaluation token's 30 cases), the cases already played are
-in the report and the summary, the ones left are marked skipped, and the job fails with the API's reason.
+If the API stops a run part-way (the daily quota, an evaluation token's 30 cases), or `time-limit` is reached, the
+cases already played are in the report and the summary, the ones left are marked skipped, and the job fails with the
+reason.
+
+## What a run records
+
+`results.json` says what was tested, next to each case's result, so a regression can be tied to a version:
+
+| Field | |
+| --- | --- |
+| `commit`, `branch`, `repository` | The commit under test (a pull request's own head, not GitHub's merge commit) and its branch; outside Actions, from `git` in the current directory. |
+| `engine` | The engine's version as the runner read it: `libvlc 3.0.21`, `ffmpeg 7.1.5`, `gstreamer 1.24.2`, `mpv 0.38.0`. Empty for `cmd`, and when the engine didn't load. |
+| `player_version` | The `player-version` input (`--player-version`). |
+| `runner`, `os`, `arch` | The runner's version and the machine. |
+| `snapshot`, `started`, `finished`, `stopped`, `time_limit_min` | The snapshot, when the run started and ended, and why it stopped early, if it did. |
+
+The job summary has the same in one line: `Tested: commit 3f2a9c1e04b7 (main), libvlc 3.0.21, runner 0.3.0 on linux x86_64`.
 
 ## Players
 

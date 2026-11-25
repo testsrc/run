@@ -32,6 +32,9 @@ jobs:
       matrix:
         os: [ubuntu-24.04, windows-2025]
     runs-on: ${{ matrix.os }}
+    # GitHub's default is 6 hours. 30 minutes, or 6 hours for every case (all); time-limit below stops the run
+    # 5 or 10 minutes before, keeping its report, where a job killed at timeout-minutes loses it
+    timeout-minutes: ${{ inputs.set == 'all' && 360 || 30 }}
     steps:
       - uses: actions/checkout@v4
       # The libvlc your app ships. Here the distribution's; for your own build, point LIBVLC (Linux: the path of
@@ -47,6 +50,8 @@ jobs:
       - uses: testsrc/run@v1
         with:
           token: ${{ secrets.TESTSRC_TOKEN }}
+          # minutes: the runner stops some minutes before timeout-minutes and keeps its report
+          time-limit: ${{ inputs.set == 'all' && 350 || 25 }}
           player: libvlc
           set: ${{ github.event_name == 'pull_request' && 'starter' || (github.event_name == 'workflow_dispatch' && inputs.set == 'all') && 'all' || env.TESTSRC_WEEKLY }}
           exclude: duration/
