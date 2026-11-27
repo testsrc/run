@@ -40,8 +40,13 @@ pub fn play(template: &str, path: &str, timeout: f64) -> Vec<Value> {
     };
     let err = tail.join().unwrap_or_default();
     if code != json!(0) {
-        if let Some(last) = err.lines().rev().find(|l| !l.trim().is_empty()) {
-            events.push(json!({"t": "log", "level": "error", "msg": last.trim()}));
+        // the last line is the error the log check counts; the ones before it (up to report::LOG_LINES) are kept as
+        // info, so a failed case's results show what led to it
+        let lines: Vec<&str> = err.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+        let from = lines.len().saturating_sub(crate::report::LOG_LINES);
+        for (i, l) in lines.iter().enumerate().skip(from) {
+            let level = if i + 1 == lines.len() { "error" } else { "info" };
+            events.push(json!({"t": "log", "level": level, "msg": l}));
         }
     }
     events.push(json!({"t": "exit", "code": code, "wall": pyfmt::round_to(t0.elapsed().as_secs_f64(), 2)}));

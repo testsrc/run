@@ -32,6 +32,11 @@ const fn fail(at: usize, status: u16, code: &'static str, msg: &'static str) -> 
 /// The catalog, facts and files of `cases` (ids like "codec/a.mp4"), failing as `fail_at` says. Returns the base URL
 /// and the request log.
 fn api(cases: &[&str], fail_at: Option<Fail>) -> (String, Arc<Mutex<Vec<String>>>) {
+    api_with(cases, fail_at, serde_json::Value::Null)
+}
+
+/// The same API with the catalog's sets (null: an API that doesn't send them)
+fn api_with(cases: &[&str], fail_at: Option<Fail>, sets: serde_json::Value) -> (String, Arc<Mutex<Vec<String>>>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let base = format!("http://{}/v1", listener.local_addr().unwrap());
     let mut routes: HashMap<String, Vec<u8>> = HashMap::new();
@@ -48,7 +53,7 @@ fn api(cases: &[&str], fail_at: Option<Fail>) -> (String, Arc<Mutex<Vec<String>>
         routes.insert(format!("/v1/files/{id}"), body);
         entries.push(serde_json::json!({"id": id, "layer": 1, "outcome": "must play", "size_bytes": 10, "files": [name]}));
     }
-    routes.insert("/v1/catalog".into(), serde_json::json!({"snapshot": "2026-11-06", "cases": entries}).to_string().into_bytes());
+    routes.insert("/v1/catalog".into(), serde_json::json!({"snapshot": "2026-11-06", "cases": entries, "sets": sets}).to_string().into_bytes());
     let log = Arc::new(Mutex::new(vec![]));
     let seen = log.clone();
     std::thread::spawn(move || {
@@ -275,11 +280,31 @@ fn case_selection() {
     let out = testsrc(&["list", "starter"], &base, &[]);
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(text.contains("2 cases in snapshot"), "starter names the starter cases there are: {text}");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("testsrc: starter: 10 general cases\n"), "an API without sets: the built-in list");
     let out = testsrc(&["list", "nothing/"], &base, &[]);
     assert_eq!(out.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&out.stderr).contains("no case matches"));
     let out = testsrc(&["list", "--exclude", "edge/"], &base, &[]);
     assert!(String::from_utf8_lossy(&out.stdout).contains("2 cases in snapshot"));
+}
+
+#[test]
+fn starter_per_player() {
+    // list and fetch count starter as run plays it: the general cases, plus the engine's with --player
+    let sets = serde_json::json!({"starter": {"general": ["codec/a.mp4"], "engines": {"libvlc": ["edge/x.mp4"]}}});
+    let (base, _) = api_with(&["codec/a.mp4", "edge/x.mp4", "fps/60.mp4"], None, sets);
+    let out = testsrc(&["list", "starter"], &base, &[]);
+    assert!(String::from_utf8_lossy(&out.stdout).contains("1 cases in snapshot"), "no player: the general cases");
+    let out = testsrc(&["list", "starter", "--player", "libvlc"], &base, &[]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("edge/x.mp4") && text.contains("2 cases in snapshot"), "{text}");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("1 general cases and 1 that libvlc got wrong"));
+    let out = testsrc(&["list", "starter", "--player", "ffmpeg"], &base, &[]);
+    assert!(String::from_utf8_lossy(&out.stdout).contains("1 cases in snapshot"), "an engine with nothing extra");
+    let cache = tmp("fetch-player");
+    let out = testsrc(&["fetch", "starter", "--player", "libvlc", "--cache", cache.to_str().unwrap()], &base, &[]);
+    assert_eq!(out.status.code(), Some(0));
+    assert!(cache.join("2026-11-06/edge/x.mp4").exists());
 }
 
 #[test]
@@ -304,9 +329,61 @@ fn a_flaky_player_passes_on_a_retry_and_keeps_the_first_failure() {
     assert!(retry[2].as_str().unwrap().starts_with("passed on retry 1; the first run failed: run: exit code 3"));
     // always failing: every retry used, the failure stays
     let dir = tmp("retry-fail");
-    let out = run(&base, &dir, "exit 3 # {file}", &["--retries", "1"]);
+    let out = run(&base, &dir, "echo opening >&2; echo 'bad header' >&2; exit 3 # {file}", &["--retries", "1"]);
     assert_eq!(out.status.code(), Some(1));
-    assert_eq!(results(&dir)["counts"]["fail"], 1);
+    let r = results(&dir);
+    assert_eq!(r["counts"]["fail"], 1);
+    // a failed case keeps the tail of what the player wrote, and its events without the frames
+    let c = &r["results"][0];
+    assert_eq!(c["log"], serde_json::json!(["opening", "bad header"]));
+    let ev = c["events"].as_array().unwrap();
+    assert!(ev.iter().any(|e| e["t"] == "exit" && e["code"] == 3), "{ev:?}");
+    assert!(ev.iter().any(|e| e["t"] == "frames" && e["count"] == 0), "{ev:?}");
+    assert!(c["checks"].as_array().unwrap().iter().any(|l| l[1] == "log" && l[2].as_str().unwrap().starts_with("1 error lines")),
+            "only the last line counts as an error: {c}");
+}
+
+// Launch plan item 16: the lock file's expected failures run and are reported, but don't fail the run
+#[test]
+fn expected_failures_in_the_lock_file_dont_fail_the_run() {
+    let (base, _) = api(&CASES, None);
+    let dir = tmp("expected");
+    let lock = dir.join("testsrc.lock");
+    // a and b fail, c passes
+    let cmd = "echo {file} | grep -q c.mp4 && exit 0; exit 3";
+    std::fs::write(&lock, "snapshot = \"2026-11-06\"\nexpected = [\n  \"codec/a.mp4\",  # known\n  \"codec/c\",\n  \"nothing/\",\n]\n").unwrap();
+    let out = run(&base, &dir, cmd, &["--lock", lock.to_str().unwrap()]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "b isn't on the list: {err}");
+    assert!(err.contains("testsrc: nothing/, on the lock file's expected list, is no case of snapshot"), "{err}");
+    assert!(err.contains("testsrc: 1 on the lock file's expected list now passes: codec/c.mp4"), "{err}");
+    let r = results(&dir);
+    assert_eq!(r["counts"]["fail"], 2);
+    assert_eq!(r["counts"]["expected failures"], 1);
+    assert_eq!(r["counts"]["expected but passed"], 1);
+    let ids = |k: &str| r["results"].as_array().unwrap().iter().filter(|c| c.get(k).is_some()).map(|c| c["id"].as_str().unwrap().to_string()).collect::<Vec<_>>();
+    assert_eq!(ids("expected"), ["codec/a.mp4", "codec/c.mp4"]);
+    assert_eq!(r["expected"], serde_json::json!(["codec/a.mp4", "codec/c", "nothing/"]), "the list as written");
+    assert_eq!(r["exclude"], serde_json::json!([]));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("(expected) run: exit code 3"));
+    let junit = std::fs::read_to_string(dir.join("report.xml")).unwrap();
+    assert!(junit.contains("failures=\"1\""), "{junit}");
+    let summary = std::fs::read_to_string(dir.join("summary.md")).unwrap();
+    assert!(summary.contains("now passes, though on the lock file's expected failures:** `codec/c.mp4`"), "{summary}");
+
+    // b on the list too (a prefix): the run passes
+    std::fs::write(&lock, "expected = [\"codec/a\", \"codec/b.mp4\"]\n").unwrap();
+    let out = run(&base, &dir, cmd, &["--lock", lock.to_str().unwrap(), "--exclude", "codec/c"]);
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(results(&dir)["exclude"], serde_json::json!(["codec/c"]));
+
+    // no lock file: no list; a malformed one stops before any case runs
+    let out = run(&base, &dir, cmd, &["--lock", dir.join("none.lock").to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(1));
+    std::fs::write(&lock, "expected = \"codec/a.mp4\"\n").unwrap();
+    let out = run(&base, &dir, cmd, &["--lock", lock.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("testsrc.lock, line 1: expected must be a list"));
 }
 
 #[test]
@@ -342,6 +419,12 @@ fn a_player_that_cant_load_is_a_result_and_the_run_goes_on() {
         for c in r["results"].as_array().unwrap() {
             assert!(matches!(c["status"].as_str().unwrap(), "fail" | "crash"), "{player}: {}", c["status"]);
         }
+        assert_eq!(r["engine"], serde_json::Value::Null, "{player}: no version read, none made up");
+        // what to do, said at the first case and at the end, in results.json and the summary (not per case)
+        let err = String::from_utf8_lossy(&out.stderr);
+        let hint = if player == "ffmpeg" { "Put ffmpeg and ffprobe 5.1 or later on PATH" } else { "sudo apt-get install -y" };
+        assert_eq!(err.matches(hint).count(), 2, "{player}: {err}");
+        assert!(r["setup_error"].as_str().unwrap().contains(hint), "{player}");
         if player == "libvlc" {
             assert!(r["player"].as_str().unwrap().ends_with("(RGB callbacks)"));
         }
@@ -451,4 +534,119 @@ fn a_download_that_never_matches_stops_after_two_retries() {
     assert_eq!(r["counts"]["skipped"], 3);
     assert!(r["stopped"].as_str().unwrap().starts_with("checksum mismatch for codec/a.mp4"));
     assert!(!dir.join("cache/2026-11-06/codec/a.mp4").exists(), "no bad file left in the cache");
+}
+
+// Launch plan item 14: --time-limit stops the run like the API does (exit 2, results so far, the rest not run), so the
+// report outlives the CI job's own limit.
+#[test]
+fn the_time_limit_stops_the_run_and_keeps_the_report() {
+    let (base, log) = api(&CASES, None);
+    let dir = tmp("timelimit");
+    // 0.03 min = 1.8 s: a plays (1 s), b is cut while it plays, c is never fetched
+    let out = run(&base, &dir, "sleep 1 # {file}", &["--time-limit", "0.03"]);
+    assert_eq!(out.status.code(), Some(2), "{}", String::from_utf8_lossy(&out.stderr));
+    let r = results(&dir);
+    assert_eq!(r["counts"]["pass"], 1);
+    assert_eq!(r["counts"]["skipped"], 2);
+    assert_eq!(r["counts"]["hang"], 0, "a case cut by the limit isn't the player's hang");
+    assert_eq!(r["time_limit_min"], 0.03);
+    assert_eq!(r["stopped"], "the time limit of 0.03 minutes was reached");
+    assert_eq!(r["results"][1]["checks"][0][2], "not run: the time limit of 0.03 minutes was reached while it played");
+    assert_eq!(r["results"][2]["checks"][0][2], "not run: the time limit of 0.03 minutes was reached");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("testsrc: the time limit of 0.03 minutes was reached. Stopping here"), "{err}");
+    let summary = std::fs::read_to_string(dir.join("summary.md")).unwrap();
+    assert!(summary.contains("**Stopped early:** the time limit of 0.03 minutes was reached. 2 cases weren't run."), "{summary}");
+    assert!(std::fs::read_to_string(dir.join("report.xml")).unwrap().contains("<skipped message=\"not run: the time limit"));
+    assert_eq!(gets_of(&log, "/v1/cases/codec/c.mp4/facts"), 0, "nothing fetched past the limit");
+}
+
+#[test]
+fn a_retry_never_runs_past_the_time_limit() {
+    let (base, _) = api(&["codec/a.mp4", "codec/b.mp4"], None);
+    let dir = tmp("timelimit-retry");
+    // a fails after 1.2 s; its retry is cut at 1.8 s, so a keeps its failure, and b isn't run
+    let out = run(&base, &dir, "sleep 1.2; exit 3 # {file}", &["--time-limit", "0.03", "--retries", "3"]);
+    assert_eq!(out.status.code(), Some(2));
+    let r = results(&dir);
+    assert_eq!(r["results"][0]["status"], "fail");
+    assert_eq!(r["results"][1]["status"], "skipped");
+}
+
+#[test]
+fn a_time_limit_of_zero_is_refused() {
+    let out = testsrc(&["run", "--player", "cmd", "--command", "true {file}", "--time-limit", "0"], "http://127.0.0.1:9/v1", &[]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("--time-limit is in minutes and must be more than 0, not 0"));
+}
+
+// Launch plan item 15: results.json says what was tested.
+#[test]
+fn results_say_what_was_tested() {
+    let (base, _) = api(&["codec/a.mp4"], None);
+    let dir = tmp("versions");
+    let mut c = Command::new(env!("CARGO_BIN_EXE_testsrc"));
+    c.args(["run", "--player", "cmd", "--command", "true {file}", "--player-version", " 1.4.2-rc1 ", "--out"]).arg(dir.join("out"))
+        .env("TESTSRC_API", &base).env("TESTSRC_TOKEN", TOKEN).env("TESTSRC_CACHE", dir.join("cache"))
+        .env("GITHUB_STEP_SUMMARY", dir.join("summary.md")).env_remove("TESTSRC_SNAPSHOT")
+        .env("TESTSRC_COMMIT", "0123456789abcdef0123456789abcdef01234567").env("GITHUB_SHA", "ffff")
+        .env("GITHUB_HEAD_REF", "feature/x").env("GITHUB_REF_NAME", "7/merge").env("GITHUB_REPOSITORY", "acme/player");
+    let out = c.output().unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+    let r = results(&dir);
+    assert_eq!(r["commit"], "0123456789abcdef0123456789abcdef01234567", "TESTSRC_COMMIT (a pull request's head) first");
+    assert_eq!(r["branch"], "feature/x", "a pull request's head branch, not 7/merge");
+    assert_eq!(r["repository"], "acme/player");
+    assert_eq!(r["set"], serde_json::json!(["all"]), "no cases named: every case");
+    assert_eq!(r["player_version"], "1.4.2-rc1");
+    assert_eq!(r["engine"], serde_json::Value::Null, "a cmd player has no engine the runner knows");
+    assert_eq!(r["time_limit_min"], serde_json::Value::Null);
+    assert!(r["finished"].as_str().unwrap().ends_with('Z'));
+    let line = "Tested: commit 0123456789ab (feature/x), player version 1.4.2-rc1, runner ";
+    assert!(String::from_utf8_lossy(&out.stdout).contains(line));
+    assert!(std::fs::read_to_string(dir.join("summary.md")).unwrap().contains(line));
+}
+
+// A stub git on PATH (CI's image has none): what `git rev-parse` would print in a checkout of branch $STUB_BRANCH.
+#[test]
+fn outside_actions_the_commit_and_branch_come_from_git() {
+    let (base, _) = api(&["codec/a.mp4"], None);
+    let dir = tmp("versions-git");
+    let bin = dir.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let stub = bin.join("git");
+    // written by a child sh: a write handle held by this process can leak into a child another test forks at that
+    // moment, and running the stub then fails with "text file busy" (ETXTBSY)
+    let mut sh = Command::new("sh").args(["-c", "cat > \"$1\" && chmod 755 \"$1\"", "sh"]).arg(&stub)
+        .stdin(std::process::Stdio::piped()).spawn().unwrap();
+    std::io::Write::write_all(&mut sh.stdin.take().unwrap(),
+        b"#!/bin/sh\ncase \"$*\" in\n  'rev-parse HEAD') echo 0123abcd ;;\n  'rev-parse --abbrev-ref HEAD') echo \"$STUB_BRANCH\" ;;\n  *) exit 1 ;;\nesac\n").unwrap();
+    assert!(sh.wait().unwrap().success());
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
+    let run_in = |envs: &[(&str, &str)]| {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_testsrc"));
+        c.args(["run", "--player", "cmd", "--command", "true {file}", "--out"]).arg(dir.join("out"))
+            .env("PATH", &path).env("STUB_BRANCH", "dev")
+            .env("TESTSRC_API", &base).env("TESTSRC_TOKEN", TOKEN).env("TESTSRC_CACHE", dir.join("cache"))
+            .env_remove("TESTSRC_SNAPSHOT").env_remove("TESTSRC_COMMIT").env_remove("GITHUB_SHA").env_remove("GITHUB_HEAD_REF")
+            .env_remove("GITHUB_REF_NAME").env_remove("GITHUB_REPOSITORY").env_remove("GITHUB_STEP_SUMMARY").env_remove("TESTSRC_PLAYER_VERSION");
+        for (k, v) in envs {
+            c.env(k, v);
+        }
+        assert_eq!(c.output().unwrap().status.code(), Some(0));
+        results(&dir)
+    };
+    let r = run_in(&[]);
+    assert_eq!(r["commit"], "0123abcd");
+    assert_eq!(r["branch"], "dev");
+    assert_eq!(r["repository"], serde_json::Value::Null);
+    assert_eq!(r["player_version"], serde_json::Value::Null);
+    // a detached checkout ("HEAD") has no branch; GITHUB_SHA and GITHUB_REF_NAME win over git
+    assert_eq!(run_in(&[("STUB_BRANCH", "HEAD")])["branch"], serde_json::Value::Null);
+    let r = run_in(&[("GITHUB_SHA", "abc"), ("GITHUB_REF_NAME", "main"), ("TESTSRC_PLAYER_VERSION", "  ")]);
+    assert_eq!((r["commit"].as_str(), r["branch"].as_str()), (Some("abc"), Some("main")));
+    assert_eq!(r["player_version"], serde_json::Value::Null, "a blank version is no version");
+    // no git at all, or not a checkout: nothing
+    let r = run_in(&[("PATH", "/usr/bin:/bin"), ("GIT_DIR", "/nonexistent")]);
+    assert_eq!((r["commit"].clone(), r["branch"].clone()), (serde_json::Value::Null, serde_json::Value::Null));
 }

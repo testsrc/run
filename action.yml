@@ -14,7 +14,7 @@ inputs:
     description: "For player: cmd. The command line, with {file} for the case's path, like `./build/myplayer --headless {file}`."
     default: ""
   set:
-    description: "Which cases: starter (10 cases, about two minutes), case ids and prefixes separated by spaces or new lines (hls/ edge/rotation-90-display-matrix.mp4), or all (company tokens only)."
+    description: "Which cases: starter (10 general cases, plus up to 10 that testsrc's own matrix finds your engine getting wrong; a few minutes), case ids and prefixes separated by spaces or new lines (hls/ edge/rotation-90-display-matrix.mp4), or all (company tokens only). On GitHub's hosted runners: at most 30 cases and 2 GB a job, and not all (run that on a self-hosted runner)."
     default: starter
   exclude:
     description: Leave out cases whose id starts with one of these (space or new line separated), like duration/.
@@ -23,11 +23,20 @@ inputs:
     description: "The snapshot to test against. Empty: the one in the lock file, or the latest, written to the lock file. latest: the newest, lock file untouched. Or a date (2026-11-06)."
     default: ""
   lock:
-    description: The lock file that pins the snapshot.
+    description: "The lock file that pins the snapshot, and lists the expected failures: cases that run and are reported but don't fail the job (needs runner 0.3.0)."
     default: testsrc.lock
   report-only:
     description: "true: report failures in the summary and JUnit, but don't fail the job. Errors (a bad token, no such case, a quota hit mid-run) still fail it, after the report."
     default: "false"
+  time-limit:
+    description: "Minutes after which the runner stops and keeps what it has: the report of the cases played, the rest marked not run, and the job fails saying so. Set it a few minutes below the job's timeout-minutes, which ends the job without a report. Empty: no limit. Needs runner 0.3.0."
+    default: ""
+  player-version:
+    description: "Your player's version, as you name it (1.4.2, a build number), recorded in results.json with the commit and the engine's own version (which the runner reads itself). Needs runner 0.3.0."
+    default: ""
+  upload:
+    description: "true (the default): send results.json to testsrc when the run ends, so your account's Runs page keeps the history (180 days) and the summary says what broke or got fixed since the last run on this branch. false: the results stay in this job."
+    default: "true"
   runner-version:
     description: A runner version (0.2.0 or later), or latest.
     default: latest
@@ -49,8 +58,11 @@ outputs:
     description: Path of the JUnit report.
     value: ${{ steps.run.outputs.junit }}
   failed:
-    description: How many cases failed, crashed or hung.
+    description: How many cases failed, crashed or hung, not counting the lock file's expected failures.
     value: ${{ steps.run.outputs.failed }}
+  run-url:
+    description: The run's page on testsrc (your account's Runs), when it was uploaded by a token tied to an account.
+    value: ${{ steps.run.outputs.run-url }}
 
 runs:
   using: composite
@@ -65,7 +77,10 @@ runs:
         IN_RUNNER_VERSION: ${{ inputs.runner-version }}
         IN_SET: ${{ inputs.set }}
         IN_PLAYER: ${{ inputs.player }}
+        IN_TIME_LIMIT: ${{ inputs.time-limit }}
+        IN_PLAYER_VERSION: ${{ inputs.player-version }}
         IN_PRIVATE: ${{ github.event.repository.private }}
+        IN_RUNNER_ENV: ${{ runner.environment }}
         IN_FORK: ${{ github.event.pull_request.head.repo.fork }}
         IN_ACTOR: ${{ github.actor }}
         TESTSRC_API: ${{ inputs.api }}
@@ -98,6 +113,13 @@ runs:
         IN_SET: ${{ inputs.set }}
         IN_EXCLUDE: ${{ inputs.exclude }}
         IN_REPORT_ONLY: ${{ inputs.report-only }}
+        IN_UPLOAD: ${{ inputs.upload }}
         IN_OUT: ${{ inputs.out }}
         IN_LOCK_NOTE: ${{ steps.resolve.outputs.lock-note }}
         IN_DISCARD: ${{ steps.resolve.outputs.discard }}
+        IN_TIME_LIMIT: ${{ steps.resolve.outputs.time-limit }}
+        IN_PLAYER_VERSION: ${{ steps.resolve.outputs.player-version }}
+        IN_HOSTED: ${{ steps.resolve.outputs.hosted }}
+        IN_LOCK_FILE: ${{ steps.resolve.outputs.lock-file }}
+        # a pull request's own head commit: github.sha is then the merge commit GitHub made for the run
+        TESTSRC_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}

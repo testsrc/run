@@ -1,0 +1,31 @@
+# This repository's own checks, on every pull request and push to main: the runner builds and its tests pass, run.sh
+# is valid shell, and action.yml and the example workflows are valid YAML. Nothing here needs a testsrc token.
+# (It is exported from testsrc's oss/.github/workflows/ci.yml; change it there.)
+name: CI
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: The action's script
+        run: |
+          bash -n run.sh
+          shellcheck -S warning run.sh
+      - name: action.yml and the examples are YAML
+        run: python3 -c 'import sys, yaml; [yaml.safe_load(open(f)) for f in sys.argv[1:]]' action.yml examples/*.yml .github/workflows/*.yml
+      - name: The runner's tests
+        working-directory: client
+        run: |
+          rustup toolchain install 1.95 --profile minimal
+          rustup default 1.95
+          cargo test --locked --workspace

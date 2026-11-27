@@ -642,7 +642,7 @@ dependencies = [
 
 [[package]]
 name = "testsrc"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "clap",
  "libloading",
@@ -655,7 +655,7 @@ dependencies = [
 
 [[package]]
 name = "testsrc-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "flate2",
  "serde_json",

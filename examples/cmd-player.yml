@@ -8,15 +8,13 @@ on:
   pull_request:
   schedule: [{ cron: "0 4 * * 1" }]
   workflow_dispatch:
-    inputs:
-      set:
-        description: "weekly: the weekly run's 30 cases. all: every case (company tokens only)."
-        type: choice
-        options: [weekly, all]
-        default: weekly
 # Pull requests: the 10 starter cases. Every Monday: TESTSRC_WEEKLY, the starter cases and 20 more, 30 different
-# cases in all, which an evaluation token can fetch. Swap ids as you like (testsrc.com/cases). Every case (`all`)
-# only by hand (Actions > this workflow > Run workflow), and only with a company token.
+# cases in all, which an evaluation token can fetch, also by hand (Actions > this workflow > Run workflow). Swap ids as
+# you like (testsrc.com/cases). GitHub's hosted runners take at most 30 cases and 2 GB a job: every case (`all`, company
+# tokens) goes on a self-hosted runner (README: "Fast checks on GitHub's runners, full runs on your own").
+concurrency:
+  group: testsrc-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 env:
   TESTSRC_WEEKLY: >-
     starter edge/anamorphic-sar-4-3.mp4 edge/audio-starts-500ms-late.mp4
@@ -29,6 +27,9 @@ env:
 jobs:
   testsrc:
     runs-on: ubuntu-24.04
+    # GitHub's default is 6 hours; time-limit below stops the run 5 minutes before, keeping its report, where a job
+    # killed at timeout-minutes loses it
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - name: Build the player
@@ -36,9 +37,12 @@ jobs:
       - uses: testsrc/run@v1
         with:
           token: ${{ secrets.TESTSRC_TOKEN }}
+          # minutes: the runner stops some minutes before timeout-minutes and keeps its report
+          time-limit: 25
+          # player-version: ${{ github.ref_name }}   # your player's version, kept in results.json
           player: cmd
           command: ./build/myplayer --headless --exit-at-end {file}
-          set: ${{ github.event_name == 'pull_request' && 'starter' || (github.event_name == 'workflow_dispatch' && inputs.set == 'all') && 'all' || env.TESTSRC_WEEKLY }}
+          set: ${{ github.event_name == 'pull_request' && 'starter' || env.TESTSRC_WEEKLY }}
           exclude: duration/
       - uses: actions/upload-artifact@v4
         if: always()
