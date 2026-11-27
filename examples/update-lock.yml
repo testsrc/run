@@ -13,6 +13,7 @@ permissions:
 jobs:
   update:
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - name: Move testsrc.lock to the newest snapshot
@@ -36,7 +37,9 @@ jobs:
               comm -23 old.txt new.txt | sed "s/.*/- removed \`&\`/" | head -200
               cd "$GITHUB_WORKSPACE"
             fi; } > "$RUNNER_TEMP/body.md"
-          printf '# The testsrc snapshot this repository tests against, written by testsrc/run. Commit it to keep\n# every run on the same files; the monthly update job moves it to the next snapshot.\nsnapshot = "%s"\n' "$new" > testsrc.lock
+          # only the snapshot line changes: the rest (the expected failures, comments) stays as you wrote it
+          if [ -n "$old" ]; then sed -i "s/^snapshot *=.*/snapshot = \"$new\"/" testsrc.lock
+          else printf '# The testsrc snapshot this repository tests against, written by testsrc/run. Commit it to keep\n# every run on the same files; the monthly update job moves it to the next snapshot.\nsnapshot = "%s"\n' "$new" > testsrc.lock; fi
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git switch -c "$branch" && git add testsrc.lock && git commit -m "testsrc: snapshot $new" && git push origin "$branch"

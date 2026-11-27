@@ -10,6 +10,11 @@ pub struct CaseResult {
     pub wall: f64,
     pub player: Option<String>,
     pub checks: Vec<Line>,
+    /// For a case that didn't pass: the tail of the player's log and what else it reported (`trace`), so the
+    /// failure can be read without the events folder. Null otherwise.
+    pub trace: Value,
+    /// On the lock file's list of expected failures: reported, but a failure doesn't fail the run
+    pub expected: bool,
 }
 
 impl CaseResult {
@@ -36,8 +41,53 @@ impl CaseResult {
         if !w.is_empty() {
             v["warnings"] = w.into();
         }
+        if self.expected {
+            v["expected"] = true.into();
+        }
+        if let Some(t) = self.trace.as_object() {
+            for (k, x) in t {
+                v[k] = x.clone();
+            }
+        }
         v
     }
+}
+
+/// How many of the player's last log lines a failed case keeps, and how long each may be.
+pub const LOG_LINES: usize = 20;
+const LOG_CHARS: usize = 300;
+
+/// The last LOG_LINES non-empty lines of a text, each cut to LOG_CHARS.
+pub fn tail(lines: impl DoubleEndedIterator<Item = String>) -> Vec<String> {
+    let mut t: Vec<String> = lines.rev().map(|l| l.trim_end().to_string()).filter(|l| !l.trim().is_empty())
+        .take(LOG_LINES).map(|l| testsrc_core::pyfmt::prefix(&l, LOG_CHARS).to_string()).collect();
+    t.reverse();
+    t
+}
+
+/// What a failed case keeps of its events: `log`, the tail of the player's log lines, and `events`, everything else
+/// in order with the frames folded into one `{"t": "frames", "count", "first", "last"}` where they started.
+pub fn trace(events: &[Value]) -> Value {
+    let log = tail(events.iter().filter(|e| e["t"] == "log").filter_map(|e| e["msg"].as_str()).map(String::from)
+        .collect::<Vec<_>>().into_iter());
+    let frames: Vec<&Value> = events.iter().filter(|e| e["t"] == "frame").collect();
+    let mut rest = vec![];
+    for e in events {
+        match e["t"].as_str() {
+            Some("log") => {}
+            Some("frame") => {
+                if std::ptr::eq(e, frames[0]) {
+                    rest.push(json!({"t": "frames", "count": frames.len(), "first": frames[0]["pts"],
+                                     "last": frames[frames.len() - 1]["pts"]}));
+                }
+            }
+            _ => rest.push(e.clone()),
+        }
+    }
+    if frames.is_empty() {
+        rest.push(json!({"t": "frames", "count": 0}));
+    }
+    json!({"log": log, "events": rest})
 }
 
 /// The cases that passed with warnings.
@@ -45,13 +95,31 @@ pub fn warned(results: &[CaseResult]) -> Vec<&CaseResult> {
     results.iter().filter(|r| r.status == "pass" && !r.warnings().is_empty()).collect()
 }
 
+/// The cases that failed, crashed or hung and weren't expected to: what fails the run.
+pub fn broke(results: &[CaseResult]) -> impl Iterator<Item = &CaseResult> {
+    results.iter().filter(|r| matches!(r.status, "fail" | "crash" | "hang") && !r.expected)
+}
+
+/// The cases on the expected list that failed as expected.
+pub fn expected_failures(results: &[CaseResult]) -> Vec<&CaseResult> {
+    results.iter().filter(|r| r.expected && matches!(r.status, "fail" | "crash" | "hang")).collect()
+}
+
+/// The cases on the expected list that passed: to take off it.
+pub fn now_passing(results: &[CaseResult]) -> Vec<&CaseResult> {
+    results.iter().filter(|r| r.expected && r.status == "pass").collect()
+}
+
 pub const STATUSES: [&str; 5] = ["pass", "fail", "crash", "hang", "skipped"];
 
-/// How many cases ended each way, then how many of the passes have warnings ("with warnings"): the console's
-/// closing line and results.json's counts.
+/// How many cases ended each way, then how many of the passes have warnings ("with warnings"), and how many of the
+/// failures were on the expected list ("expected failures") and how many on it passed ("expected but passed"):
+/// the console's closing line and results.json's counts.
 pub fn counts(results: &[CaseResult]) -> Vec<(&'static str, usize)> {
     let mut c: Vec<_> = STATUSES.iter().map(|&s| (s, results.iter().filter(|r| r.status == s).count())).collect();
     c.push(("with warnings", warned(results).len()));
+    c.push(("expected failures", expected_failures(results).len()));
+    c.push(("expected but passed", now_passing(results).len()));
     c
 }
 
@@ -60,13 +128,18 @@ fn xml(s: &str) -> String {
 }
 
 pub fn junit(results: &[CaseResult], suite: &str) -> String {
-    let fails = results.iter().filter(|r| r.status != "pass" && r.status != "skipped").count();
+    let fails = broke(results).count();
     let mut out = format!("<testsuite name=\"{}\" tests=\"{}\" failures=\"{fails}\">\n", xml(suite), results.len());
     for r in results {
         out += &format!("  <testcase classname=\"{}\" name=\"{}\" time=\"{}\">\n", xml(suite), xml(&r.id), r.wall);
         let text: String = r.checks.iter().map(|l| format!("{:4}  {:12} {}", l.status.name(), l.what, l.detail)).collect::<Vec<_>>().join("\n");
         match r.status {
             "skipped" => out += &format!("    <skipped message=\"{}\"/>\n", xml(&r.checks[0].detail)),
+            // an expected failure is reported as skipped, so a JUnit reader doesn't fail the build on it
+            s if r.expected && s != "pass" => {
+                out += &format!("    <skipped message=\"{}\"/>\n    <system-out>{}</system-out>\n",
+                                xml(&format!("expected failure: {s}: {}", r.first_failure())), xml(&text));
+            }
             "pass" => out += &format!("    <system-out>{}</system-out>\n", xml(&text)),
             s => {
                 let first = r.checks.iter().find(|l| l.status.name() == "FAIL").map(|l| l.detail.as_str()).unwrap_or(s);
@@ -78,11 +151,15 @@ pub fn junit(results: &[CaseResult], suite: &str) -> String {
     out + "</testsuite>\n"
 }
 
-/// Markdown for the GitHub Actions run summary: counts, then what didn't pass with its first failure.
-pub fn github_summary(results: &[CaseResult], player: &str, snapshot: &str) -> String {
+/// Markdown for the GitHub Actions run summary: counts and what was tested (`tested`: the commit, the versions),
+/// then what didn't pass with its first failure.
+pub fn github_summary(results: &[CaseResult], player: &str, snapshot: &str, tested: &str) -> String {
     let c = counts(results);
     let line: Vec<String> = c.iter().filter(|(_, n)| *n > 0).map(|(s, n)| format!("{n} {s}")).collect();
     let mut md = format!("### testsrc: {player}, snapshot {snapshot}\n\n{}\n\n", line.join(", "));
+    if !tested.is_empty() {
+        md += &format!("{}\n\n", tested.replace('|', "\\|"));
+    }
     let w = warned(results);
     if !w.is_empty() {
         md += &format!("**{} passed with warnings**\n\n| Case | Warning |\n| --- | --- |\n", w.len());
@@ -91,13 +168,27 @@ pub fn github_summary(results: &[CaseResult], player: &str, snapshot: &str) -> S
         }
         md += "\n";
     }
-    let bad: Vec<&CaseResult> = results.iter().filter(|r| r.status != "pass" && r.status != "skipped").collect();
-    if !bad.is_empty() {
-        md += "| Case | Result | First failure |\n| --- | --- | --- |\n";
-        for r in bad {
-            md += &format!("| `{}` | {} | {} |\n", r.id, r.status, r.first_failure().replace('|', "\\|"));
+    let table = |rows: &[&CaseResult]| {
+        let mut t = String::from("| Case | Result | First failure |\n| --- | --- | --- |\n");
+        for r in rows {
+            t += &format!("| `{}` | {} | {} |\n", r.id, r.status, r.first_failure().replace('|', "\\|"));
         }
-        md += "\n";
+        t + "\n"
+    };
+    let bad: Vec<&CaseResult> = broke(results).collect();
+    if !bad.is_empty() {
+        md += &table(&bad);
+    }
+    let now = now_passing(results);
+    if !now.is_empty() {
+        md += &format!("**{} now pass{}, though on the lock file's expected failures:** {}. Take {} off the list, so a new \
+failure there fails the job.\n\n", now.len(), if now.len() == 1 { "es" } else { "" },
+                       now.iter().map(|r| format!("`{}`", r.id)).collect::<Vec<_>>().join(", "), if now.len() == 1 { "it" } else { "them" });
+    }
+    let xf = expected_failures(results);
+    if !xf.is_empty() {
+        md += &format!("<details><summary>{} expected failures, listed in the lock file: they don't fail the job</summary>\n\n{}</details>\n\n",
+                       xf.len(), table(&xf));
     }
     let passed: Vec<String> = results.iter().filter(|r| r.status == "pass").map(|r| format!("`{}`", r.id)).collect();
     if !passed.is_empty() {
@@ -129,7 +220,7 @@ mod tests {
     use testsrc_core::Status;
 
     fn r(id: &str, status: &'static str, checks: Vec<(Status, &str, &str)>) -> CaseResult {
-        CaseResult { id: id.into(), status, wall: 6.2, player: Some("p".into()),
+        CaseResult { id: id.into(), status, wall: 6.2, player: Some("p".into()), trace: Value::Null, expected: false,
                      checks: checks.into_iter().map(|(s, w, d)| Line { status: s, what: w.into(), detail: d.into() }).collect() }
     }
 
@@ -154,11 +245,62 @@ mod tests {
         // the console: the case's line shows its warning, the closing line counts them
         assert_eq!(s[4].first_failure(), "warning: frames: partial playback, ended cleanly: 90/180 frames played, missing 90-179");
         assert_eq!(s[1].first_failure(), "");
-        assert_eq!(counts(&s).last(), Some(&("with warnings", 1)));
-        assert_eq!(counts(&s[..2]).last(), Some(&("with warnings", 0)));
-        let md = github_summary(&s, "mpv 0.41.0", "2026-11-11");
+        assert!(counts(&s).contains(&("with warnings", 1)));
+        assert!(counts(&s[..2]).contains(&("with warnings", 0)));
+        let md = github_summary(&s, "mpv 0.41.0", "2026-11-11", "");
         assert!(md.contains("**1 passed with warnings**\n\n| Case | Warning |"));
         assert!(md.contains("| `damage/x-truncated-10.mp4` | frames: partial playback, ended cleanly: 90/180 frames played, missing 90-179 |"));
+    }
+
+    #[test]
+    fn a_failed_case_keeps_the_tail_of_its_log_and_its_events_with_the_frames_folded() {
+        let mut ev = vec![json!({"t": "meta", "player": "libvlc 3.0.24"})];
+        ev.extend((0..30).map(|i| json!({"t": "log", "level": "error", "msg": format!("line {i}")})));
+        ev.extend((0..5).map(|i| json!({"t": "frame", "pts": i as f64 / 25.0, "code": i})));
+        ev.push(json!({"t": "log", "level": "error", "msg": "  "}));
+        ev.push(json!({"t": "log", "level": "error", "msg": "x".repeat(400)}));
+        ev.push(json!({"t": "exit", "code": 0, "wall": 1.5}));
+        let t = trace(&ev);
+        let log = t["log"].as_array().unwrap();
+        assert_eq!(log.len(), LOG_LINES);
+        assert_eq!(log[0], "line 11", "the last lines, oldest first, blank ones left out");
+        assert_eq!(log[LOG_LINES - 1].as_str().unwrap().len(), 300);
+        assert_eq!(t["events"], json!([{"t": "meta", "player": "libvlc 3.0.24"},
+                                       {"t": "frames", "count": 5, "first": 0.0, "last": 0.16},
+                                       {"t": "exit", "code": 0, "wall": 1.5}]));
+        // no frame at all says so
+        let none = trace(&[json!({"t": "exit", "code": 1})]);
+        assert_eq!(none["events"], json!([{"t": "exit", "code": 1}, {"t": "frames", "count": 0}]));
+        assert_eq!(none["log"], json!([]));
+        // to_json puts them beside the checks; a pass has none
+        let mut f = r("a.mp4", "fail", vec![(Status::Fail, "frames", "none")]);
+        f.trace = t;
+        assert_eq!(f.to_json()["log"][0], "line 11");
+        assert!(f.to_json()["events"].is_array());
+        assert!(sample()[1].to_json().get("log").is_none());
+    }
+
+    #[test]
+    fn expected_failures_are_reported_but_dont_count_as_broken() {
+        let mut s = sample();
+        s[0].expected = true; // hls/ts.m3u8 fails, as expected
+        s[1].expected = true; // codec/h264-aac.mp4 passes, though expected to fail
+        assert_eq!(broke(&s).map(|r| r.id.as_str()).collect::<Vec<_>>(), ["x/<a&b>.mp4"]);
+        assert!(counts(&s).contains(&("expected failures", 1)) && counts(&s).contains(&("expected but passed", 1)));
+        assert_eq!(s[0].to_json()["expected"], true);
+        assert!(s[3].to_json().get("expected").is_none());
+        let x = junit(&s, "t");
+        assert!(x.contains("failures=\"1\""));
+        assert!(x.contains("<skipped message=\"expected failure: fail: frames: 179/180 frames shown, missing 179\"/>"));
+        let md = github_summary(&s, "p", "2026-11-11", "");
+        assert!(md.contains("**1 now passes, though on the lock file's expected failures:** `codec/h264-aac.mp4`. Take it off"));
+        assert!(md.contains("<details><summary>1 expected failures, listed in the lock file: they don't fail the job</summary>\n\n| Case |"));
+        // the table of what broke has the crash only
+        let broken = md.split("<details>").next().unwrap();
+        assert!(broken.contains("| `x/<a&b>.mp4` | crash |") && !broken.contains("| `hls/ts.m3u8` |"));
+        s[0].expected = false;
+        s[1].expected = false;
+        assert!(!github_summary(&s, "p", "2026-11-11", "").contains("expected"));
     }
 
     #[test]
@@ -173,8 +315,9 @@ mod tests {
 
     #[test]
     fn summary_lists_what_did_not_pass() {
-        let md = github_summary(&sample(), "libvlc 3.0.24", "2026-10-29");
-        assert!(md.starts_with("### testsrc: libvlc 3.0.24, snapshot 2026-10-29\n\n2 pass, 1 fail, 1 crash, 1 skipped, 1 with warnings\n"));
+        let md = github_summary(&sample(), "libvlc 3.0.24", "2026-10-29", "Tested: commit 0123abc (main), runner 0.2.2 on linux x86_64");
+        assert!(md.starts_with("### testsrc: libvlc 3.0.24, snapshot 2026-10-29\n\n2 pass, 1 fail, 1 crash, 1 skipped, 1 with warnings\n\n\
+                                Tested: commit 0123abc (main), runner 0.2.2 on linux x86_64\n\n"));
         assert!(md.contains("| `hls/ts.m3u8` | fail | frames: 179/180 frames shown, missing 179 |"));
         assert!(md.contains(r"ended with a signal: \|x\|")); // pipes escaped inside the table
         assert!(md.contains("<details><summary>2 passed</summary>"));
@@ -182,7 +325,8 @@ mod tests {
 
     #[test]
     fn counts_in_order() {
-        assert_eq!(counts(&sample()), vec![("pass", 2), ("fail", 1), ("crash", 1), ("hang", 0), ("skipped", 1), ("with warnings", 1)]);
+        assert_eq!(counts(&sample()), vec![("pass", 2), ("fail", 1), ("crash", 1), ("hang", 0), ("skipped", 1), ("with warnings", 1),
+                                           ("expected failures", 0), ("expected but passed", 0)]);
     }
 
     #[test]
